@@ -413,6 +413,12 @@ impl EditorView {
     ) {
         let text = doc.text().slice(..);
         let last_line = view.last_line(doc);
+        let last_line_width = match config.line_number {
+            LineNumber::Absolute | LineNumber::Relative => {
+                (last_line + 1).to_string().chars().count()
+            }
+            LineNumber::None => 0,
+        };
 
         // it's used inside an iterator so the collect isn't needless:
         // https://github.com/rust-lang/rust-clippy/issues/6164

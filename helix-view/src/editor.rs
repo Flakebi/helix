@@ -117,6 +117,9 @@ pub enum LineNumber {
 
     /// Show relative line number to the primary cursor
     Relative,
+
+    /// Do not show the line number
+    None,
 }
 
 impl Default for Config {
