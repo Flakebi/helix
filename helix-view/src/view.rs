@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::{
+    editor::Config,
     graphics::Rect,
     gutter::{self, Gutter},
     Document, DocumentId, ViewId,
@@ -64,7 +65,7 @@ impl JumpList {
     }
 }
 
-const GUTTERS: &[(Gutter, usize)] = &[(gutter::diagnostic, 1), (gutter::line_number, 5)];
+const GUTTERS: &[Gutter] = &[gutter::DIAGNOSTIC_GUTTER, gutter::LINE_NUMBER_GUTTER];
 
 #[derive(Debug)]
 pub struct View {
@@ -83,7 +84,7 @@ pub struct View {
 }
 
 impl View {
-    pub fn new(doc: DocumentId, config: crate::editor::Config) -> Self {
+    pub fn new(doc: DocumentId) -> Self {
         Self {
             id: ViewId::default(),
             doc,
@@ -95,7 +96,7 @@ impl View {
         }
     }
 
-    pub fn gutters(&self) -> &[(Gutter, usize)] {
+    pub fn gutters(&self) -> &[Gutter] {
         GUTTERS
     }
 
@@ -104,7 +105,8 @@ impl View {
         let offset = self
             .gutters()
             .iter()
-            .map(|(_, width)| *width as u16)
+            // .map(|gutter| (gutter.width)(self, /*config*/ &Config::default(), panic!()) as u16)
+            .map(|gutter| 5 as u16)
             .sum::<u16>()
             + 1; // +1 for some space between gutters and line
         self.area.clip_left(offset).clip_bottom(1) // -1 for statusline

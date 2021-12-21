@@ -3,16 +3,33 @@ use std::fmt::Write;
 use crate::{editor::Config, graphics::Style, Document, Theme, View};
 
 pub type GutterFn<'doc> = Box<dyn Fn(usize, bool, &mut String) -> Option<Style> + 'doc>;
-pub type Gutter =
-    for<'doc> fn(&'doc Document, &View, &Theme, &Config, bool, usize) -> GutterFn<'doc>;
 
-pub fn diagnostic<'doc>(
+pub struct Gutter {
+    pub render: for<'doc> fn(&'doc Document, &View, &Theme, &Config, bool) -> GutterFn<'doc>,
+    pub width: fn(&View, &Config, &Document) -> usize,
+}
+// pub type Gutter =
+// for<'doc> fn(&'doc Document, &View, &Theme, &Config, bool, usize) -> GutterFn<'doc>;
+
+pub const DIAGNOSTIC_GUTTER: Gutter = Gutter {
+    render: diagnostic_render,
+    width: |_, _, _| 1,
+};
+
+/// Computes the number of decimal digits needed to print a number.
+pub fn digits10(n: usize) -> usize {
+    std::iter::successors(Some(n), |n| {
+        let n = n / 10;
+        (n != 0).then(|| n)
+    })
+    .count()
+}
+pub fn diagnostic_render<'doc>(
     doc: &'doc Document,
     _view: &View,
     theme: &Theme,
     _config: &Config,
     _is_focused: bool,
-    _width: usize,
 ) -> GutterFn<'doc> {
     let warning = theme.get("warning");
     let error = theme.get("error");
@@ -36,14 +53,27 @@ pub fn diagnostic<'doc>(
     })
 }
 
-pub fn line_number<'doc>(
+pub const LINE_NUMBER_GUTTER: Gutter = Gutter {
+    render: line_number_render,
+    width: line_number_width,
+};
+
+fn line_number_width(_view: &View, config: &Config, doc: &Document) -> usize {
+    if config.line_number == crate::editor::LineNumber::None {
+        0
+    } else {
+        digits10(doc.text().len_lines())
+    }
+}
+
+fn line_number_render<'doc>(
     doc: &'doc Document,
     view: &View,
     theme: &Theme,
     config: &Config,
     is_focused: bool,
-    width: usize,
 ) -> GutterFn<'doc> {
+    let width = line_number_width(view, config, doc);
     let text = doc.text().slice(..);
     let last_line = view.last_line(doc);
     // Whether to draw the line number for the last line of the
@@ -60,11 +90,15 @@ pub fn line_number<'doc>(
     let config = config.line_number;
 
     Box::new(move |line: usize, selected: bool, out: &mut String| {
+        use crate::editor::LineNumber;
+        if config == LineNumber::None {
+            return None;
+        }
+
         if line == last_line && !draw_last {
             write!(out, "{:>1$}", '~', width).unwrap();
             Some(linenr)
         } else {
-            use crate::editor::LineNumber;
             let line = match config {
                 LineNumber::Absolute => line + 1,
                 LineNumber::Relative => {
@@ -74,6 +108,7 @@ pub fn line_number<'doc>(
                         abs_diff(current_line, line)
                     }
                 }
+                LineNumber::None => unreachable!(),
             };
             let style = if selected && is_focused {
                 linenr_select

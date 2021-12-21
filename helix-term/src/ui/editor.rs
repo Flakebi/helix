@@ -413,12 +413,6 @@ impl EditorView {
     ) {
         let text = doc.text().slice(..);
         let last_line = view.last_line(doc);
-        let last_line_width = match config.line_number {
-            LineNumber::Absolute | LineNumber::Relative => {
-                (last_line + 1).to_string().chars().count()
-            }
-            LineNumber::None => 0,
-        };
 
         // it's used inside an iterator so the collect isn't needless:
         // https://github.com/rust-lang/rust-clippy/issues/6164
@@ -436,9 +430,10 @@ impl EditorView {
         // avoid lots of small allocations by reusing a text buffer for each line
         let mut text = String::with_capacity(8);
 
-        for (constructor, width) in view.gutters() {
-            let gutter = constructor(doc, view, theme, config, is_focused, *width);
-            text.reserve(*width); // ensure there's enough space for the gutter
+        for gutter in view.gutters() {
+            let width = (gutter.width)(view, config, doc);
+            let gutter = (gutter.render)(doc, view, theme, config, is_focused);
+            text.reserve(width); // ensure there's enough space for the gutter
             for (i, line) in (view.offset.row..(last_line + 1)).enumerate() {
                 let selected = cursors.contains(&line);
 
@@ -447,13 +442,13 @@ impl EditorView {
                         viewport.x + offset,
                         viewport.y + i as u16,
                         &text,
-                        *width,
+                        width,
                         gutter_style.patch(style),
                     );
                 }
                 text.clear();
             }
-            offset += *width as u16;
+            offset += width as u16;
         }
     }
 
