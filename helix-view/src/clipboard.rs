@@ -60,7 +60,16 @@ pub fn get_clipboard_provider() -> Box<dyn ClipboardProvider> {
     // TODO: support for user-defined provider, probably when we have plugin support by setting a
     // variable?
 
-    if exists("pbcopy") && exists("pbpaste") {
+    let supports_ansi_clipboard = terminfo::Database::from_env()
+        .map(|db| db.get::<terminfo::capability::SetClipboard>().is_some())
+        .unwrap_or_else(|err| {
+            log::debug!("Failed to get terminfo database: {}", err);
+            false
+        });
+
+    if supports_ansi_clipboard {
+        Box::new(provider::TermProvider::default())
+    } else if exists("pbcopy") && exists("pbpaste") {
         command_provider! {
             paste => "pbpaste";
             copy => "pbcopy";
@@ -183,6 +192,81 @@ mod provider {
                 ClipboardType::Clipboard => self.buf = content,
                 ClipboardType::Selection => self.primary_buf = content,
             }
+            Ok(())
+        }
+    }
+
+    /// Clipboard provider using ANSI escape sequences.
+    ///
+    /// The clipboard sequences are described at https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+    #[cfg(not(target_os = "windows"))]
+    #[derive(Debug, Default)]
+    pub struct TermProvider;
+
+    #[cfg(not(target_os = "windows"))]
+    impl TermProvider {
+        fn get_clip_char(clipboard_type: ClipboardType) -> &'static str {
+            match clipboard_type {
+                ClipboardType::Clipboard => "",
+                ClipboardType::Selection => "p",
+            }
+        }
+
+        fn term_command(cmd: &str) -> Result<String> {
+            use std::io::{Read, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")?;
+            file.write_all(cmd.as_bytes())?;
+
+            let mut res = String::new();
+            for b in file.bytes() {
+                let b = b?;
+                res.push(b as char);
+                if b == b'\\' {
+                    break;
+                }
+            }
+
+            Ok(res)
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    impl ClipboardProvider for TermProvider {
+        fn name(&self) -> Cow<str> {
+            Cow::Borrowed("ansi-escape-codes")
+        }
+
+        fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String> {
+            let value = Self::term_command(&format!(
+                "\x1b]52;{};?\x1b\\",
+                Self::get_clip_char(clipboard_type),
+            ))?;
+            // Format is like \b]52;c;<base64>\b\\
+            if let Some(rest) = value
+                .strip_prefix("\x1b]52;")
+                .and_then(|s| s.strip_suffix("\x1b\\"))
+            {
+                if let Some(start) = rest.find(';') {
+                    return Ok(String::from_utf8(base64::decode(&rest[start + 1..])?)?);
+                }
+            }
+
+            log::debug!("unexpected clipboard escape sequence: {:?}", value);
+            bail!("The clipboard escape sequence does not have the expected format");
+        }
+
+        fn set_contents(&mut self, content: String, clipboard_type: ClipboardType) -> Result<()> {
+            crossterm::execute!(
+                std::io::stdout(),
+                crossterm::style::Print(format!(
+                    "\x1b]52;{};{}\x1b\\",
+                    Self::get_clip_char(clipboard_type),
+                    base64::encode(content)
+                ))
+            )?;
             Ok(())
         }
     }
