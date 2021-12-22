@@ -1,6 +1,7 @@
 // Implementation reference: https://github.com/neovim/neovim/blob/f2906a4669a2eef6d7bf86a29648793d63c98949/runtime/autoload/provider/clipboard.vim#L68-L152
 
 use anyhow::Result;
+use futures_util::future::BoxFuture;
 use std::borrow::Cow;
 
 pub enum ClipboardType {
@@ -8,10 +9,14 @@ pub enum ClipboardType {
     Selection,
 }
 
-pub trait ClipboardProvider: std::fmt::Debug {
+pub trait ClipboardProvider: std::fmt::Debug + Send + Sync {
     fn name(&self) -> Cow<str>;
-    fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String>;
-    fn set_contents(&mut self, contents: String, clipboard_type: ClipboardType) -> Result<()>;
+    fn get_contents(&self, clipboard_type: ClipboardType) -> BoxFuture<Result<String>>;
+    fn set_contents(
+        &mut self,
+        contents: String,
+        clipboard_type: ClipboardType,
+    ) -> BoxFuture<Result<()>>;
 }
 
 macro_rules! command_provider {
@@ -153,6 +158,7 @@ fn is_exit_success(program: &str, args: &[&str]) -> bool {
 mod provider {
     use super::{ClipboardProvider, ClipboardType};
     use anyhow::{bail, Context as _, Result};
+    use futures_util::future::{self, BoxFuture};
     use std::borrow::Cow;
 
     #[cfg(not(target_os = "windows"))]
@@ -178,21 +184,25 @@ mod provider {
             Cow::Borrowed("none")
         }
 
-        fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String> {
+        fn get_contents(&self, clipboard_type: ClipboardType) -> BoxFuture<Result<String>> {
             let value = match clipboard_type {
                 ClipboardType::Clipboard => self.buf.clone(),
                 ClipboardType::Selection => self.primary_buf.clone(),
             };
 
-            Ok(value)
+            Box::pin(future::ok(value))
         }
 
-        fn set_contents(&mut self, content: String, clipboard_type: ClipboardType) -> Result<()> {
+        fn set_contents(
+            &mut self,
+            content: String,
+            clipboard_type: ClipboardType,
+        ) -> BoxFuture<Result<()>> {
             match clipboard_type {
                 ClipboardType::Clipboard => self.buf = content,
                 ClipboardType::Selection => self.primary_buf = content,
             }
-            Ok(())
+            Box::pin(future::ok(()))
         }
     }
 
@@ -239,35 +249,43 @@ mod provider {
             Cow::Borrowed("ansi-escape-codes")
         }
 
-        fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String> {
-            let value = Self::term_command(&format!(
-                "\x1b]52;{};?\x1b\\",
-                Self::get_clip_char(clipboard_type),
-            ))?;
-            // Format is like \b]52;c;<base64>\b\\
-            if let Some(rest) = value
-                .strip_prefix("\x1b]52;")
-                .and_then(|s| s.strip_suffix("\x1b\\"))
-            {
-                if let Some(start) = rest.find(';') {
-                    return Ok(String::from_utf8(base64::decode(&rest[start + 1..])?)?);
+        fn get_contents(&self, clipboard_type: ClipboardType) -> BoxFuture<Result<String>> {
+            Box::pin(async {
+                let value = Self::term_command(&format!(
+                    "\x1b]52;{};?\x1b\\",
+                    Self::get_clip_char(clipboard_type),
+                ))?;
+                // Format is like \b]52;c;<base64>\b\\
+                if let Some(rest) = value
+                    .strip_prefix("\x1b]52;")
+                    .and_then(|s| s.strip_suffix("\x1b\\"))
+                {
+                    if let Some(start) = rest.find(';') {
+                        return Ok(String::from_utf8(base64::decode(&rest[start + 1..])?)?);
+                    }
                 }
-            }
 
-            log::debug!("unexpected clipboard escape sequence: {:?}", value);
-            bail!("The clipboard escape sequence does not have the expected format");
+                log::debug!("unexpected clipboard escape sequence: {:?}", value);
+                bail!("The clipboard escape sequence does not have the expected format");
+            })
         }
 
-        fn set_contents(&mut self, content: String, clipboard_type: ClipboardType) -> Result<()> {
-            crossterm::execute!(
-                std::io::stdout(),
-                crossterm::style::Print(format!(
-                    "\x1b]52;{};{}\x1b\\",
-                    Self::get_clip_char(clipboard_type),
-                    base64::encode(content)
-                ))
-            )?;
-            Ok(())
+        fn set_contents(
+            &mut self,
+            content: String,
+            clipboard_type: ClipboardType,
+        ) -> BoxFuture<Result<()>> {
+            Box::pin(async {
+                crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::style::Print(format!(
+                        "\x1b]52;{};{}\x1b\\",
+                        Self::get_clip_char(clipboard_type),
+                        base64::encode(content)
+                    ))
+                )?;
+                Ok(())
+            })
         }
     }
 
@@ -302,16 +320,17 @@ mod provider {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     pub struct CommandConfig {
         pub prg: &'static str,
         pub args: &'static [&'static str],
     }
 
     impl CommandConfig {
-        fn execute(&self, input: Option<&str>, pipe_output: bool) -> Result<Option<String>> {
-            use std::io::Write;
-            use std::process::{Command, Stdio};
+        async fn execute(&self, input: Option<&str>, pipe_output: bool) -> Result<Option<String>> {
+            use std::process::Stdio;
+            use tokio::io::AsyncWriteExt;
+            use tokio::process::Command;
 
             let stdin = input.map(|_| Stdio::piped()).unwrap_or_else(Stdio::null);
             let stdout = pipe_output.then(Stdio::piped).unwrap_or_else(Stdio::null);
@@ -327,11 +346,12 @@ mod provider {
                 let mut stdin = child.stdin.take().context("stdin is missing")?;
                 stdin
                     .write_all(input.as_bytes())
+                    .await
                     .context("couldn't write in stdin")?;
             }
 
             // TODO: add timer?
-            let output = child.wait_with_output()?;
+            let output = child.wait_with_output().await?;
 
             if !output.status.success() {
                 bail!("clipboard provider {} failed", self.prg);
@@ -362,34 +382,40 @@ mod provider {
             }
         }
 
-        fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String> {
-            match clipboard_type {
-                ClipboardType::Clipboard => Ok(self
-                    .get_cmd
-                    .execute(None, true)?
-                    .context("output is missing")?),
+        fn get_contents(&self, clipboard_type: ClipboardType) -> BoxFuture<Result<String>> {
+            let cmd = match clipboard_type {
+                ClipboardType::Clipboard => &self.get_cmd,
                 ClipboardType::Selection => {
                     if let Some(cmd) = &self.get_primary_cmd {
-                        return cmd.execute(None, true)?.context("output is missing");
+                        cmd
+                    } else {
+                        return Box::pin(future::ok(String::new()));
                     }
-
-                    Ok(String::new())
                 }
             }
+            .clone();
+
+            Box::pin(async move { cmd.execute(None, true).await?.context("output is missing") })
         }
 
-        fn set_contents(&mut self, value: String, clipboard_type: ClipboardType) -> Result<()> {
+        fn set_contents(
+            &mut self,
+            value: String,
+            clipboard_type: ClipboardType,
+        ) -> BoxFuture<Result<()>> {
             let cmd = match clipboard_type {
                 ClipboardType::Clipboard => &self.set_cmd,
                 ClipboardType::Selection => {
                     if let Some(cmd) = &self.set_primary_cmd {
                         cmd
                     } else {
-                        return Ok(());
+                        return Box::pin(future::ok(()));
                     }
                 }
-            };
-            cmd.execute(Some(&value), false).map(|_| ())
+            }
+            .clone();
+
+            Box::pin(async move { cmd.execute(Some(&value), false).await.map(|_| ()) })
         }
     }
 }

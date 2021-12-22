@@ -190,7 +190,7 @@ use etcetera::base_strategy::{choose_base_strategy, BaseStrategy};
 
 pub use ropey::{Rope, RopeBuilder, RopeSlice};
 
-pub use tendril::StrTendril as Tendril;
+pub type Tendril = tendril::Tendril<tendril::fmt::UTF8, tendril::Atomic>;
 
 #[doc(inline)]
 pub use {regex, tree_sitter};

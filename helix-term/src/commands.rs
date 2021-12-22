@@ -40,7 +40,7 @@ use crate::{
 };
 
 use crate::job::{self, Job, Jobs};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{future, future::BoxFuture, FutureExt, StreamExt};
 use std::{collections::HashSet, num::NonZeroUsize};
 use std::{fmt, future::Future};
 
@@ -56,6 +56,19 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+/// Early escape from functions that return a future.
+/// Copied and adjusted from the [try_future](https://github.com/srijs/rust-try-future) crate.
+macro_rules! try_future {
+    ($expression:expr) => {
+        match $expression {
+            Err(err) => {
+                return Box::pin(futures_util::future::err(err.into()));
+            }
+            Ok(value) => value,
+        }
+    };
+}
 
 pub struct Context<'a> {
     pub register: Option<char>,
@@ -170,7 +183,7 @@ macro_rules! static_commands {
 }
 
 impl MappableCommand {
-    pub fn execute(&self, cx: &mut Context) {
+    pub async fn execute(&self, cx: &mut Context<'_>) {
         match &self {
             MappableCommand::Typable { name, args, doc: _ } => {
                 let args: Vec<Cow<str>> = args.iter().map(Cow::from).collect();
@@ -180,7 +193,7 @@ impl MappableCommand {
                         jobs: cx.jobs,
                         scroll: None,
                     };
-                    if let Err(e) = (command.fun)(&mut cx, &args[..], PromptEvent::Validate) {
+                    if let Err(e) = (command.fun)(&mut cx, &args[..], PromptEvent::Validate).await {
                         cx.editor.set_error(format!("{}", e));
                     }
                 }
@@ -1965,70 +1978,77 @@ pub mod cmd {
         pub aliases: &'static [&'static str],
         pub doc: &'static str,
         // params, flags, helper, completer
-        pub fun: fn(&mut compositor::Context, &[Cow<str>], PromptEvent) -> anyhow::Result<()>,
+        pub fun: for<'a> fn(
+            &'a mut compositor::Context,
+            &[Cow<str>],
+            PromptEvent,
+        ) -> BoxFuture<'a, anyhow::Result<()>>,
         pub completer: Option<Completer>,
     }
 
-    fn quit(
-        cx: &mut compositor::Context,
+    fn quit<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         // last view and we have unsaved changes
         if cx.editor.tree.views().count() == 1 {
-            buffers_remaining_impl(cx.editor)?
+            try_future!(buffers_remaining_impl(cx.editor))
         }
 
         cx.editor.close(view!(cx.editor).id);
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn force_quit(
-        cx: &mut compositor::Context,
+    fn force_quit<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         cx.editor.close(view!(cx.editor).id);
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn open(
-        cx: &mut compositor::Context,
+    fn open<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         ensure!(!args.is_empty(), "wrong argument count");
         for arg in args {
             let _ = cx.editor.open(arg.as_ref().into(), Action::Replace)?;
         }
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn buffer_close(
-        cx: &mut compositor::Context,
+    fn buffer_close<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let view = view!(cx.editor);
         let doc_id = view.doc;
         cx.editor.close_document(doc_id, false)?;
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn force_buffer_close(
-        cx: &mut compositor::Context,
+    fn force_buffer_close<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let view = view!(cx.editor);
         let doc_id = view.doc;
         cx.editor.close_document(doc_id, true)?;
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn write_impl(cx: &mut compositor::Context, path: Option<&Cow<str>>) -> anyhow::Result<()> {
+    fn write_impl<'a>(
+        cx: &'a mut compositor::Context,
+        path: Option<&Cow<str>>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let jobs = &mut cx.jobs;
         let (_, doc) = current!(cx.editor);
 
@@ -2057,32 +2077,32 @@ pub mod cmd {
             let id = doc.id();
             let _ = cx.editor.refresh_language_server(id);
         }
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn write(
-        cx: &mut compositor::Context,
+    fn write<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         write_impl(cx, args.first())
     }
 
-    fn new_file(
-        cx: &mut compositor::Context,
+    fn new_file<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         cx.editor.new_file(Action::Replace);
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn format(
-        cx: &mut compositor::Context,
+    fn format<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let (_, doc) = current!(cx.editor);
 
         if let Some(format) = doc.format() {
@@ -2091,13 +2111,13 @@ pub mod cmd {
             cx.jobs.callback(callback);
         }
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
-    fn set_indent_style(
-        cx: &mut compositor::Context,
+    fn set_indent_style<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         use IndentStyle::*;
 
         // If no argument, report current indent style.
@@ -2109,7 +2129,7 @@ pub mod cmd {
                 Spaces(n) if (2..=8).contains(&n) => format!("{} spaces", n),
                 _ => "error".into(), // Shouldn't happen.
             });
-            return Ok(());
+            return Box::pin(future::ok(()));
         }
 
         // Attempt to parse argument as an indent style.
@@ -2128,15 +2148,15 @@ pub mod cmd {
         let doc = doc_mut!(cx.editor);
         doc.indent_style = style;
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
     /// Sets or reports the current document's line ending setting.
-    fn set_line_ending(
-        cx: &mut compositor::Context,
+    fn set_line_ending<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         use LineEnding::*;
 
         // If no argument, report current line ending setting.
@@ -2153,7 +2173,7 @@ pub mod cmd {
                 VT | LS | PS => "error".into(),
             });
 
-            return Ok(());
+            return Box::pin(future::ok(()));
         }
 
         let arg = args
@@ -2173,14 +2193,14 @@ pub mod cmd {
         };
 
         doc_mut!(cx.editor).line_ending = line_ending;
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn earlier(
-        cx: &mut compositor::Context,
+    fn earlier<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let uk = args.join(" ").parse::<UndoKind>().map_err(|s| anyhow!(s))?;
 
         let (view, doc) = current!(cx.editor);
@@ -2189,14 +2209,14 @@ pub mod cmd {
             cx.editor.set_status("Already at oldest change".to_owned());
         }
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn later(
-        cx: &mut compositor::Context,
+    fn later<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let uk = args.join(" ").parse::<UndoKind>().map_err(|s| anyhow!(s))?;
         let (view, doc) = current!(cx.editor);
         let success = doc.later(view.id, uk);
@@ -2204,29 +2224,29 @@ pub mod cmd {
             cx.editor.set_status("Already at newest change".to_owned());
         }
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn write_quit(
-        cx: &mut compositor::Context,
+    fn write_quit<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         write_impl(cx, args.first())?;
         quit(cx, &[], event)
     }
 
-    fn force_write_quit(
-        cx: &mut compositor::Context,
+    fn force_write_quit<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         write_impl(cx, args.first())?;
         force_quit(cx, &[], event)
     }
 
     /// Results an error if there are modified buffers remaining and sets editor error,
-    /// otherwise returns `Ok(())`
+    /// otherwise returns `Box::pin(future::ok((`
     pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> {
         let modified: Vec<_> = editor
             .documents()
@@ -2283,27 +2303,27 @@ pub mod cmd {
         bail!(errors)
     }
 
-    fn write_all(
-        cx: &mut compositor::Context,
+    fn write_all<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         write_all_impl(cx, args, event, false, false)
     }
 
-    fn write_all_quit(
-        cx: &mut compositor::Context,
+    fn write_all_quit<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         write_all_impl(cx, args, event, true, false)
     }
 
-    fn force_write_all_quit(
-        cx: &mut compositor::Context,
+    fn force_write_all_quit<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         write_all_impl(cx, args, event, true, true)
     }
 
@@ -2323,30 +2343,30 @@ pub mod cmd {
             editor.close(view_id);
         }
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn quit_all(
-        cx: &mut compositor::Context,
+    fn quit_all<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         quit_all_impl(cx.editor, args, event, false)
     }
 
-    fn force_quit_all(
-        cx: &mut compositor::Context,
+    fn force_quit_all<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         quit_all_impl(cx.editor, args, event, true)
     }
 
-    fn cquit(
-        cx: &mut compositor::Context,
+    fn cquit<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let exit_code = args
             .first()
             .and_then(|code| code.parse::<i32>().ok())
@@ -2358,14 +2378,14 @@ pub mod cmd {
             cx.editor.close(view_id);
         }
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn theme(
-        cx: &mut compositor::Context,
+    fn theme<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let theme = args.first().context("Theme not provided")?;
         let theme = cx
             .editor
@@ -2377,132 +2397,135 @@ pub mod cmd {
             bail!("Unsupported theme: theme requires true color support");
         }
         cx.editor.set_theme(theme);
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn yank_main_selection_to_clipboard(
-        cx: &mut compositor::Context,
+    fn yank_main_selection_to_clipboard<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         yank_main_selection_to_clipboard_impl(cx.editor, ClipboardType::Clipboard)
     }
 
-    fn yank_joined_to_clipboard(
-        cx: &mut compositor::Context,
+    fn yank_joined_to_clipboard<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let (_, doc) = current!(cx.editor);
         let default_sep = Cow::Borrowed(doc.line_ending.as_str());
         let separator = args.first().unwrap_or(&default_sep);
         yank_joined_to_clipboard_impl(cx.editor, separator, ClipboardType::Clipboard)
     }
 
-    fn yank_main_selection_to_primary_clipboard(
-        cx: &mut compositor::Context,
+    fn yank_main_selection_to_primary_clipboard<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         yank_main_selection_to_clipboard_impl(cx.editor, ClipboardType::Selection)
     }
 
-    fn yank_joined_to_primary_clipboard(
-        cx: &mut compositor::Context,
+    fn yank_joined_to_primary_clipboard<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let (_, doc) = current!(cx.editor);
         let default_sep = Cow::Borrowed(doc.line_ending.as_str());
         let separator = args.first().unwrap_or(&default_sep);
         yank_joined_to_clipboard_impl(cx.editor, separator, ClipboardType::Selection)
     }
 
-    fn paste_clipboard_after(
-        cx: &mut compositor::Context,
+    fn paste_clipboard_after<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         paste_clipboard_impl(cx.editor, Paste::After, ClipboardType::Clipboard, 1)
     }
 
-    fn paste_clipboard_before(
-        cx: &mut compositor::Context,
+    fn paste_clipboard_before<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         paste_clipboard_impl(cx.editor, Paste::After, ClipboardType::Clipboard, 1)
     }
 
-    fn paste_primary_clipboard_after(
-        cx: &mut compositor::Context,
+    fn paste_primary_clipboard_after<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         paste_clipboard_impl(cx.editor, Paste::After, ClipboardType::Selection, 1)
     }
 
-    fn paste_primary_clipboard_before(
-        cx: &mut compositor::Context,
+    fn paste_primary_clipboard_before<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         paste_clipboard_impl(cx.editor, Paste::After, ClipboardType::Selection, 1)
     }
 
-    fn replace_selections_with_clipboard_impl(
-        cx: &mut compositor::Context,
+    fn replace_selections_with_clipboard_impl<'a>(
+        cx: &'a mut compositor::Context,
         clipboard_type: ClipboardType,
-    ) -> anyhow::Result<()> {
-        let (view, doc) = current!(cx.editor);
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async {
+            let (view, doc) = current!(cx.editor);
+            let fut = cx.editor.clipboard_provider.get_contents(clipboard_type);
 
-        match cx.editor.clipboard_provider.get_contents(clipboard_type) {
-            Ok(contents) => {
-                let selection = doc.selection(view.id);
-                let transaction =
-                    Transaction::change_by_selection(doc.text(), selection, |range| {
-                        (range.from(), range.to(), Some(contents.as_str().into()))
-                    });
+            match fut.await {
+                Ok(contents) => {
+                    let selection = doc.selection(view.id);
+                    let transaction =
+                        Transaction::change_by_selection(doc.text(), selection, |range| {
+                            (range.from(), range.to(), Some(contents.as_str().into()))
+                        });
 
-                doc.apply(&transaction, view.id);
-                doc.append_changes_to_history(view.id);
-                Ok(())
+                    doc.apply(&transaction, view.id);
+                    doc.append_changes_to_history(view.id);
+                    Box::pin(future::ok(()))
+                }
+                Err(e) => Err(e.context("Couldn't get system clipboard contents")),
             }
-            Err(e) => Err(e.context("Couldn't get system clipboard contents")),
-        }
+        })
     }
 
-    fn replace_selections_with_clipboard(
-        cx: &mut compositor::Context,
+    fn replace_selections_with_clipboard<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         replace_selections_with_clipboard_impl(cx, ClipboardType::Clipboard)
     }
 
-    fn replace_selections_with_primary_clipboard(
-        cx: &mut compositor::Context,
+    fn replace_selections_with_primary_clipboard<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         replace_selections_with_clipboard_impl(cx, ClipboardType::Selection)
     }
 
-    fn show_clipboard_provider(
-        cx: &mut compositor::Context,
+    fn show_clipboard_provider<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         cx.editor
             .set_status(cx.editor.clipboard_provider.name().to_string());
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn change_current_directory(
-        cx: &mut compositor::Context,
+    fn change_current_directory<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let dir = helix_core::path::expand_tilde(
             args.first()
                 .context("target directory not provided")?
@@ -2519,65 +2542,65 @@ pub mod cmd {
             "Current working directory is now {}",
             cwd.display()
         ));
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn show_current_directory(
-        cx: &mut compositor::Context,
+    fn show_current_directory<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let cwd = std::env::current_dir().context("Couldn't get the new working directory")?;
         cx.editor
             .set_status(format!("Current working directory is {}", cwd.display()));
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
     /// Sets the [`Document`]'s encoding..
-    fn set_encoding(
-        cx: &mut compositor::Context,
+    fn set_encoding<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let (_, doc) = current!(cx.editor);
         if let Some(label) = args.first() {
             doc.set_encoding(label)
         } else {
             let encoding = doc.encoding().name().to_string();
             cx.editor.set_status(encoding);
-            Ok(())
+            Box::pin(future::ok(()))
         }
     }
 
     /// Reload the [`Document`] from its source file.
-    fn reload(
-        cx: &mut compositor::Context,
+    fn reload<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let (view, doc) = current!(cx.editor);
         doc.reload(view.id)
     }
 
-    fn tree_sitter_scopes(
-        cx: &mut compositor::Context,
+    fn tree_sitter_scopes<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let (view, doc) = current!(cx.editor);
         let text = doc.text().slice(..);
 
         let pos = doc.selection(view.id).primary().cursor(text);
         let scopes = indent::get_scopes(doc.syntax(), text, pos);
         cx.editor.set_status(format!("scopes: {:?}", &scopes));
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn vsplit(
-        cx: &mut compositor::Context,
+    fn vsplit<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let id = view!(cx.editor).doc;
 
         if args.is_empty() {
@@ -2589,14 +2612,14 @@ pub mod cmd {
             }
         }
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn hsplit(
-        cx: &mut compositor::Context,
+    fn hsplit<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let id = view!(cx.editor).doc;
 
         if args.is_empty() {
@@ -2608,26 +2631,26 @@ pub mod cmd {
             }
         }
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    fn tutor(
-        cx: &mut compositor::Context,
+    fn tutor<'a>(
+        cx: &'a mut compositor::Context,
         _args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let path = helix_core::runtime_dir().join("tutor.txt");
         cx.editor.open(path, Action::Replace)?;
         // Unset path to prevent accidentally saving to the original tutor file.
         doc_mut!(cx.editor).set_path(None)?;
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
-    pub(super) fn goto_line_number(
-        cx: &mut compositor::Context,
+    pub(super) fn goto_line_number<'a>(
+        cx: &'a mut compositor::Context,
         args: &[Cow<str>],
         _event: PromptEvent,
-    ) -> anyhow::Result<()> {
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         ensure!(!args.is_empty(), "Line number required");
 
         let line = args[0].parse::<usize>()?;
@@ -2638,7 +2661,7 @@ pub mod cmd {
 
         view.ensure_cursor_in_view(doc, line);
 
-        Ok(())
+        Box::pin(future::ok(()))
     }
 
     pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
@@ -4560,7 +4583,7 @@ fn yank(cx: &mut Context) {
     exit_select_mode(cx);
 }
 
-fn yank_joined_to_clipboard_impl(
+async fn yank_joined_to_clipboard_impl(
     editor: &mut Editor,
     separator: &str,
     clipboard_type: ClipboardType,
@@ -4584,6 +4607,7 @@ fn yank_joined_to_clipboard_impl(
     editor
         .clipboard_provider
         .set_contents(joined, clipboard_type)
+        .await
         .context("Couldn't set system clipboard content")?;
 
     editor.set_status(msg);
@@ -4598,7 +4622,7 @@ fn yank_joined_to_clipboard(cx: &mut Context) {
     exit_select_mode(cx);
 }
 
-fn yank_main_selection_to_clipboard_impl(
+async fn yank_main_selection_to_clipboard_impl(
     editor: &mut Editor,
     clipboard_type: ClipboardType,
 ) -> anyhow::Result<()> {
@@ -4610,6 +4634,7 @@ fn yank_main_selection_to_clipboard_impl(
     if let Err(e) = editor
         .clipboard_provider
         .set_contents(value.into_owned(), clipboard_type)
+        .await
     {
         bail!("Couldn't set system clipboard content: {}", e);
     }
@@ -4690,7 +4715,7 @@ fn paste_impl(
     Some(transaction)
 }
 
-fn paste_clipboard_impl(
+async fn paste_clipboard_impl(
     editor: &mut Editor,
     action: Paste,
     clipboard_type: ClipboardType,
@@ -4701,6 +4726,7 @@ fn paste_clipboard_impl(
     match editor
         .clipboard_provider
         .get_contents(clipboard_type)
+        .await
         .map(|contents| paste_impl(&[contents], doc, view, action, count))
     {
         Ok(Some(transaction)) => {
@@ -4782,14 +4808,14 @@ fn replace_with_yanked(cx: &mut Context) {
     }
 }
 
-fn replace_selections_with_clipboard_impl(
+async fn replace_selections_with_clipboard_impl(
     editor: &mut Editor,
     clipboard_type: ClipboardType,
     count: usize,
 ) -> anyhow::Result<()> {
     let (view, doc) = current!(editor);
 
-    match editor.clipboard_provider.get_contents(clipboard_type) {
+    match editor.clipboard_provider.get_contents(clipboard_type).await {
         Ok(contents) => {
             let selection = doc.selection(view.id);
             let transaction = Transaction::change_by_selection(doc.text(), selection, |range| {
