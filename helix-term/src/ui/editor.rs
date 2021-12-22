@@ -652,22 +652,22 @@ impl EditorView {
     /// if event was handled (a command was executed or a subkeymap was
     /// activated). Only KeymapResultKind::{NotFound, Cancelled} is returned
     /// otherwise.
-    fn handle_keymap_event(
+    async fn handle_keymap_event(
         &mut self,
         mode: Mode,
-        cxt: &mut commands::Context,
+        cxt: &mut commands::Context<'_>,
         event: KeyEvent,
-    ) -> Option<KeymapResult> {
+    ) -> Option<KeymapResult<'_>> {
         self.autoinfo = None;
         let key_result = self.keymaps.get_mut(&mode).unwrap().get(event);
         self.autoinfo = key_result.sticky.map(|node| node.infobox());
 
         match &key_result.kind {
-            KeymapResultKind::Matched(command) => command.execute(cxt),
+            KeymapResultKind::Matched(command) => command.execute(cxt).await,
             KeymapResultKind::Pending(node) => self.autoinfo = Some(node.infobox()),
             KeymapResultKind::MatchedSequence(commands) => {
                 for command in commands {
-                    command.execute(cxt);
+                    command.execute(cxt).await;
                 }
             }
             KeymapResultKind::NotFound | KeymapResultKind::Cancelled(_) => return Some(key_result),
@@ -675,8 +675,8 @@ impl EditorView {
         None
     }
 
-    fn insert_mode(&mut self, cx: &mut commands::Context, event: KeyEvent) {
-        if let Some(keyresult) = self.handle_keymap_event(Mode::Insert, cx, event) {
+    async fn insert_mode(&mut self, cx: &mut commands::Context<'_>, event: KeyEvent) {
+        if let Some(keyresult) = self.handle_keymap_event(Mode::Insert, cx, event).await {
             match keyresult.kind {
                 KeymapResultKind::NotFound => {
                     if let Some(ch) = event.char() {
@@ -691,7 +691,7 @@ impl EditorView {
                                 if let KeymapResultKind::Matched(command) =
                                     self.keymaps.get_mut(&Mode::Insert).unwrap().get(ev).kind
                                 {
-                                    command.execute(cx);
+                                    command.execute(cx).await;
                                 }
                             }
                         }
@@ -702,7 +702,7 @@ impl EditorView {
         }
     }
 
-    fn command_mode(&mut self, mode: Mode, cxt: &mut commands::Context, event: KeyEvent) {
+    async fn command_mode(&mut self, mode: Mode, cxt: &mut commands::Context<'_>, event: KeyEvent) {
         match event {
             // count handling
             key!(i @ '0'..='9') => {
@@ -713,10 +713,10 @@ impl EditorView {
             // special handling for repeat operator
             key!('.') if self.keymaps.pending().is_empty() => {
                 // first execute whatever put us into insert mode
-                self.last_insert.0.execute(cxt);
+                self.last_insert.0.execute(cxt).await;
                 // then replay the inputs
                 for &key in &self.last_insert.1.clone() {
-                    self.insert_mode(cxt, key)
+                    self.insert_mode(cxt, key).await
                 }
             }
             _ => {
@@ -729,7 +729,7 @@ impl EditorView {
                 // set the register
                 cxt.register = cxt.editor.selected_register.take();
 
-                self.handle_keymap_event(mode, cxt, event);
+                self.handle_keymap_event(mode, cxt, event).await;
                 if self.keymaps.pending().is_empty() {
                     cxt.editor.count = None
                 }
@@ -772,10 +772,10 @@ impl EditorView {
 }
 
 impl EditorView {
-    fn handle_mouse_event(
+    async fn handle_mouse_event(
         &mut self,
         event: MouseEvent,
-        cxt: &mut commands::Context,
+        cxt: &mut commands::Context<'_>,
     ) -> EventResult {
         match event {
             MouseEvent {
@@ -877,7 +877,9 @@ impl EditorView {
                     return EventResult::Ignored;
                 }
 
-                commands::MappableCommand::yank_main_selection_to_primary_clipboard.execute(cxt);
+                commands::MappableCommand::yank_main_selection_to_primary_clipboard
+                    .execute(cxt)
+                    .await;
 
                 EventResult::Consumed(None)
             }
@@ -896,7 +898,8 @@ impl EditorView {
 
                 if modifiers == crossterm::event::KeyModifiers::ALT {
                     commands::MappableCommand::replace_selections_with_primary_clipboard
-                        .execute(cxt);
+                        .execute(cxt)
+                        .await;
 
                     return EventResult::Consumed(None);
                 }
@@ -910,7 +913,9 @@ impl EditorView {
                     let doc = editor.document_mut(editor.tree.get(view_id).doc).unwrap();
                     doc.set_selection(view_id, Selection::point(pos));
                     editor.tree.focus = view_id;
-                    commands::MappableCommand::paste_primary_clipboard_before.execute(cxt);
+                    commands::MappableCommand::paste_primary_clipboard_before
+                        .execute(cxt)
+                        .await;
                     return EventResult::Consumed(None);
                 }
 

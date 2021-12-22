@@ -300,6 +300,7 @@ impl<T> Picker<T> {
             |_pattern: &str| Vec::new(),
             |_editor: &mut Context, _pattern: &str, _event: PromptEvent| {
                 //
+                Box::pin(futures_util::future::ready(()))
             },
         );
 

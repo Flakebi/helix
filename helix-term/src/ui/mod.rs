@@ -62,7 +62,7 @@ pub fn regex_prompt(
                 PromptEvent::Update => {
                     // skip empty input, TODO: trigger default
                     if input.is_empty() {
-                        return;
+                        return Box::pin(futures_util::future::ready(()));
                     }
 
                     let case_insensitive = if cx.editor.config.smart_case {
@@ -89,6 +89,7 @@ pub fn regex_prompt(
                     }
                 }
             }
+            Box::pin(futures_util::future::ready(()))
         },
     )
 }

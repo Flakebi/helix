@@ -144,7 +144,7 @@ impl Default for Config {
     }
 }
 
-pub struct Motion(pub Box<dyn Fn(&mut Editor)>);
+pub struct Motion(pub Box<dyn Fn(&mut Editor) + Send>);
 impl Motion {
     pub fn run(&self, e: &mut Editor) {
         (self.0)(e)

@@ -1,6 +1,7 @@
 use crate::compositor::{Component, Compositor, Context, EventResult};
 use crate::{alt, ctrl, key, shift, ui};
 use crossterm::event::Event;
+use futures_util::future::BoxFuture;
 use helix_view::input::KeyEvent;
 use helix_view::keyboard::{KeyCode, KeyModifiers};
 use std::{borrow::Cow, ops::RangeFrom};
@@ -25,7 +26,7 @@ pub struct Prompt {
     history_register: Option<char>,
     history_pos: Option<usize>,
     completion_fn: Box<dyn FnMut(&str) -> Vec<Completion>>,
-    callback_fn: Box<dyn FnMut(&mut Context, &str, PromptEvent)>,
+    callback_fn: Box<dyn for<'a> FnMut(&'a mut Context, &'a str, PromptEvent) -> BoxFuture<'a, ()>>,
     pub doc_fn: Box<dyn Fn(&str) -> Option<&'static str>>,
 }
 
@@ -60,7 +61,8 @@ impl Prompt {
         prompt: Cow<'static, str>,
         history_register: Option<char>,
         mut completion_fn: impl FnMut(&str) -> Vec<Completion> + 'static,
-        callback_fn: impl FnMut(&mut Context, &str, PromptEvent) + 'static,
+        callback_fn: impl for<'a> FnMut(&'a mut Context, &'a str, PromptEvent) -> BoxFuture<'a, ()>
+            + 'static,
     ) -> Self {
         Self {
             prompt,
@@ -503,11 +505,11 @@ impl Component for Prompt {
             }
             key!(Tab) => {
                 self.change_completion_selection(CompletionDirection::Forward);
-                (self.callback_fn)(cx, &self.line, PromptEvent::Update)
+                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
             }
             shift!(Tab) => {
                 self.change_completion_selection(CompletionDirection::Backward);
-                (self.callback_fn)(cx, &self.line, PromptEvent::Update)
+                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
             }
             ctrl!('q') => self.exit_selection(),
             // any char event that's not combined with control or mapped to any other combo
