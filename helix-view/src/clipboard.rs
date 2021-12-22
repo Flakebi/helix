@@ -111,8 +111,9 @@ pub fn get_clipboard_provider() -> Box<dyn ClipboardProvider> {
         }
     } else if env_var_is_set("TMUX") && exists("tmux") {
         command_provider! {
-            paste => "tmux", "save-buffer", "-";
-            copy => "tmux", "load-buffer", "-";
+            // Refresh tmux clipboard, wait a bit for it to be updated and paste it
+            paste => "sh", "-c", "tmux refresh-client -l; sleep 0.1; tmux save-buffer -";
+            copy => "tmux", "load-buffer", "-w", "-";
         }
     } else {
         #[cfg(target_os = "windows")]
