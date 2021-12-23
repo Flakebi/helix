@@ -148,32 +148,27 @@ pub enum MappableCommand {
     },
     Static {
         name: &'static str,
-        fun: fn(cx: &mut Context),
+        fun: for<'a> fn(cx: &'a mut Context) -> BoxFuture<'a, ()>,
         doc: &'static str,
     },
 }
 
 macro_rules! static_command {
-    (async $fun:ident) => {
-        $name
+    ($fun:ident, async) => {
+        $fun
     };
-    ($fun:ident) => {
+    ($fun:ident,) => {
         |cx| Box::pin(futures_util::future::ready($fun(cx)))
     };
 }
 
-macro_rules! static_command_name {
-    (async $fun:ident) => { $fun };
-    ($fun:ident) => { $fun };
-}
-
 macro_rules! static_commands {
-    ( $($($decl:tt)? $name:ident, $doc:literal,)* ) => {
+    ( $($(($decl:tt))? $name:ident, $doc:literal,)* ) => {
         $(
             #[allow(non_upper_case_globals)]
             pub const $name: Self = Self::Static {
                 name: stringify!($name),
-                fun: static_command!($($decl)?, $name),
+                fun: static_command!($name, $($decl)?),
                 doc: $doc
             };
         )*
@@ -200,7 +195,7 @@ impl MappableCommand {
                     }
                 }
             }
-            MappableCommand::Static { fun, .. } => (fun)(cx),
+            MappableCommand::Static { fun, .. } => (fun)(cx).await,
         }
     }
 
@@ -345,19 +340,19 @@ impl MappableCommand {
         earlier, "Move backward in history",
         later, "Move forward in history",
         yank, "Yank selection",
-        async yank_joined_to_clipboard, "Join and yank selections to clipboard",
-        async yank_main_selection_to_clipboard, "Yank main selection to clipboard",
-        async yank_joined_to_primary_clipboard, "Join and yank selections to primary clipboard",
-        async yank_main_selection_to_primary_clipboard, "Yank main selection to primary clipboard",
+        (async) yank_joined_to_clipboard, "Join and yank selections to clipboard",
+        (async) yank_main_selection_to_clipboard, "Yank main selection to clipboard",
+        (async) yank_joined_to_primary_clipboard, "Join and yank selections to primary clipboard",
+        (async) yank_main_selection_to_primary_clipboard, "Yank main selection to primary clipboard",
         replace_with_yanked, "Replace with yanked text",
-        async replace_selections_with_clipboard, "Replace selections by clipboard content",
-        async replace_selections_with_primary_clipboard, "Replace selections by primary clipboard content",
+        (async) replace_selections_with_clipboard, "Replace selections by clipboard content",
+        (async) replace_selections_with_primary_clipboard, "Replace selections by primary clipboard content",
         paste_after, "Paste after selection",
         paste_before, "Paste before selection",
-        async paste_clipboard_after, "Paste clipboard after selections",
-        async paste_clipboard_before, "Paste clipboard before selections",
-        async paste_primary_clipboard_after, "Paste primary clipboard after selections",
-        async paste_primary_clipboard_before, "Paste primary clipboard before selections",
+        (async) paste_clipboard_after, "Paste clipboard after selections",
+        (async) paste_clipboard_before, "Paste clipboard before selections",
+        (async) paste_primary_clipboard_after, "Paste primary clipboard after selections",
+        (async) paste_primary_clipboard_before, "Paste primary clipboard before selections",
         indent, "Indent selection",
         unindent, "Unindent selection",
         format_selections, "Format selection",
@@ -4656,11 +4651,17 @@ async fn yank_joined_to_clipboard_impl(
     Ok(())
 }
 
-fn yank_joined_to_clipboard(cx: &mut Context) {
-    let line_ending = doc!(cx.editor).line_ending;
-    let _ =
-        yank_joined_to_clipboard_impl(cx.editor, line_ending.as_str(), ClipboardType::Clipboard);
-    exit_select_mode(cx);
+fn yank_joined_to_clipboard<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
+        let line_ending = doc!(cx.editor).line_ending;
+        let _ = yank_joined_to_clipboard_impl(
+            cx.editor,
+            line_ending.as_str(),
+            ClipboardType::Clipboard,
+        )
+        .await;
+        exit_select_mode(cx);
+    })
 }
 
 async fn yank_main_selection_to_clipboard_impl(
@@ -4684,19 +4685,29 @@ async fn yank_main_selection_to_clipboard_impl(
     Ok(())
 }
 
-fn yank_main_selection_to_clipboard(cx: &mut Context) {
-    let _ = yank_main_selection_to_clipboard_impl(cx.editor, ClipboardType::Clipboard);
+fn yank_main_selection_to_clipboard<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
+        let _ = yank_main_selection_to_clipboard_impl(cx.editor, ClipboardType::Clipboard).await;
+    })
 }
 
-fn yank_joined_to_primary_clipboard(cx: &mut Context) {
-    let line_ending = doc!(cx.editor).line_ending;
-    let _ =
-        yank_joined_to_clipboard_impl(cx.editor, line_ending.as_str(), ClipboardType::Selection);
+fn yank_joined_to_primary_clipboard<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
+        let line_ending = doc!(cx.editor).line_ending;
+        let _ = yank_joined_to_clipboard_impl(
+            cx.editor,
+            line_ending.as_str(),
+            ClipboardType::Selection,
+        )
+        .await;
+    })
 }
 
-fn yank_main_selection_to_primary_clipboard(cx: &mut Context) {
-    let _ = yank_main_selection_to_clipboard_impl(cx.editor, ClipboardType::Selection);
-    exit_select_mode(cx);
+fn yank_main_selection_to_primary_clipboard<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
+        let _ = yank_main_selection_to_clipboard_impl(cx.editor, ClipboardType::Selection).await;
+        exit_select_mode(cx);
+    })
 }
 
 #[derive(Copy, Clone)]
@@ -4780,40 +4791,52 @@ async fn paste_clipboard_impl(
     }
 }
 
-fn paste_clipboard_after(cx: &mut Context) {
-    let _ = paste_clipboard_impl(
-        cx.editor,
-        Paste::After,
-        ClipboardType::Clipboard,
-        cx.count(),
-    );
+fn paste_clipboard_after<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(
+        paste_clipboard_impl(
+            cx.editor,
+            Paste::After,
+            ClipboardType::Clipboard,
+            cx.count(),
+        )
+        .map(|_| ()),
+    )
 }
 
-fn paste_clipboard_before(cx: &mut Context) {
-    let _ = paste_clipboard_impl(
-        cx.editor,
-        Paste::Before,
-        ClipboardType::Clipboard,
-        cx.count(),
-    );
+fn paste_clipboard_before<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(
+        paste_clipboard_impl(
+            cx.editor,
+            Paste::Before,
+            ClipboardType::Clipboard,
+            cx.count(),
+        )
+        .map(|_| ()),
+    )
 }
 
-fn paste_primary_clipboard_after(cx: &mut Context) {
-    let _ = paste_clipboard_impl(
-        cx.editor,
-        Paste::After,
-        ClipboardType::Selection,
-        cx.count(),
-    );
+fn paste_primary_clipboard_after<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(
+        paste_clipboard_impl(
+            cx.editor,
+            Paste::After,
+            ClipboardType::Selection,
+            cx.count(),
+        )
+        .map(|_| ()),
+    )
 }
 
-fn paste_primary_clipboard_before(cx: &mut Context) {
-    let _ = paste_clipboard_impl(
-        cx.editor,
-        Paste::Before,
-        ClipboardType::Selection,
-        cx.count(),
-    );
+fn paste_primary_clipboard_before<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(
+        paste_clipboard_impl(
+            cx.editor,
+            Paste::Before,
+            ClipboardType::Selection,
+            cx.count(),
+        )
+        .map(|_| ()),
+    )
 }
 
 fn replace_with_yanked(cx: &mut Context) {
@@ -4875,12 +4898,18 @@ async fn replace_selections_with_clipboard_impl(
     }
 }
 
-fn replace_selections_with_clipboard(cx: &mut Context) {
-    let _ = replace_selections_with_clipboard_impl(cx.editor, ClipboardType::Clipboard, cx.count());
+fn replace_selections_with_clipboard<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(
+        replace_selections_with_clipboard_impl(cx.editor, ClipboardType::Clipboard, cx.count())
+            .map(|_| ()),
+    )
 }
 
-fn replace_selections_with_primary_clipboard(cx: &mut Context) {
-    let _ = replace_selections_with_clipboard_impl(cx.editor, ClipboardType::Selection, cx.count());
+fn replace_selections_with_primary_clipboard<'a>(cx: &'a mut Context) -> BoxFuture<'a, ()> {
+    Box::pin(
+        replace_selections_with_clipboard_impl(cx.editor, ClipboardType::Selection, cx.count())
+            .map(|_| ()),
+    )
 }
 
 fn paste_after(cx: &mut Context) {
