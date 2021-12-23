@@ -4,6 +4,7 @@ use anyhow::Result;
 use futures_util::future::BoxFuture;
 use std::borrow::Cow;
 
+#[derive(Clone, Copy, Debug)]
 pub enum ClipboardType {
     Clipboard,
     Selection,
@@ -65,16 +66,7 @@ pub fn get_clipboard_provider() -> Box<dyn ClipboardProvider> {
     // TODO: support for user-defined provider, probably when we have plugin support by setting a
     // variable?
 
-    let supports_ansi_clipboard = terminfo::Database::from_env()
-        .map(|db| db.get::<terminfo::capability::SetClipboard>().is_some())
-        .unwrap_or_else(|err| {
-            log::debug!("Failed to get terminfo database: {}", err);
-            false
-        });
-
-    if supports_ansi_clipboard {
-        Box::new(provider::TermProvider::default())
-    } else if exists("pbcopy") && exists("pbpaste") {
+    if exists("pbcopy") && exists("pbpaste") {
         command_provider! {
             paste => "pbpaste";
             copy => "pbcopy";
@@ -134,7 +126,7 @@ pub fn get_clipboard_provider() -> Box<dyn ClipboardProvider> {
         return Box::new(provider::WindowsProvider::default());
 
         #[cfg(not(target_os = "windows"))]
-        return Box::new(provider::NopProvider::new());
+        Box::new(provider::TermProvider::default())
     }
 }
 
@@ -162,20 +154,10 @@ mod provider {
     use std::borrow::Cow;
 
     #[cfg(not(target_os = "windows"))]
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     pub struct NopProvider {
         buf: String,
         primary_buf: String,
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    impl NopProvider {
-        pub fn new() -> Self {
-            Self {
-                buf: String::new(),
-                primary_buf: String::new(),
-            }
-        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -211,7 +193,7 @@ mod provider {
     /// The clipboard sequences are described at https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
     #[cfg(not(target_os = "windows"))]
     #[derive(Debug, Default)]
-    pub struct TermProvider;
+    pub struct TermProvider(NopProvider);
 
     #[cfg(not(target_os = "windows"))]
     impl TermProvider {
@@ -222,23 +204,28 @@ mod provider {
             }
         }
 
-        fn term_command(cmd: &str) -> Result<String> {
-            use std::io::{Read, Write};
-            let mut file = std::fs::OpenOptions::new()
+        async fn term_command(cmd: &str) -> Result<String> {
+            use std::time::Duration;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::time::timeout;
+
+            let mut file = tokio::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open("/dev/tty")?;
-            file.write_all(cmd.as_bytes())?;
+                .open("/dev/tty")
+                .await?;
+            file.write_all(cmd.as_bytes()).await?;
 
             let mut res = String::new();
-            for b in file.bytes() {
-                let b = b?;
+            loop {
+                let b = timeout(Duration::from_millis(100), file.read_u8())
+                    .await
+                    .context("Reading escape code response")??;
                 res.push(b as char);
                 if b == b'\\' {
                     break;
                 }
             }
-
             Ok(res)
         }
     }
@@ -250,23 +237,31 @@ mod provider {
         }
 
         fn get_contents(&self, clipboard_type: ClipboardType) -> BoxFuture<Result<String>> {
-            Box::pin(async {
-                let value = Self::term_command(&format!(
+            Box::pin(async move {
+                if let Ok(value) = Self::term_command(&format!(
                     "\x1b]52;{};?\x1b\\",
                     Self::get_clip_char(clipboard_type),
-                ))?;
-                // Format is like \b]52;c;<base64>\b\\
-                if let Some(rest) = value
-                    .strip_prefix("\x1b]52;")
-                    .and_then(|s| s.strip_suffix("\x1b\\"))
+                ))
+                .await
                 {
-                    if let Some(start) = rest.find(';') {
-                        return Ok(String::from_utf8(base64::decode(&rest[start + 1..])?)?);
+                    // Format is \b]52;c;<base64>\b\\
+                    if let Some(rest) = value
+                        .strip_prefix("\x1b]52;")
+                        .and_then(|s| s.strip_suffix("\x1b\\"))
+                    {
+                        if let Some(start) = rest.find(';') {
+                            log::debug!("Got clipboard response from terminal");
+                            return Ok(String::from_utf8(base64::decode(&rest[start + 1..])?)?);
+                        }
                     }
-                }
 
-                log::debug!("unexpected clipboard escape sequence: {:?}", value);
-                bail!("The clipboard escape sequence does not have the expected format");
+                    log::debug!("unexpected clipboard escape sequence: {:?}", value);
+                    bail!("The clipboard escape sequence does not have the expected format");
+                } else {
+                    // Fallback
+                    log::debug!("Use fallback clipboard");
+                    self.0.get_contents(clipboard_type).await
+                }
             })
         }
 
@@ -275,7 +270,8 @@ mod provider {
             content: String,
             clipboard_type: ClipboardType,
         ) -> BoxFuture<Result<()>> {
-            Box::pin(async {
+            let _ = self.0.set_contents(content.clone(), clipboard_type);
+            Box::pin(future::ready(
                 crossterm::execute!(
                     std::io::stdout(),
                     crossterm::style::Print(format!(
@@ -283,9 +279,9 @@ mod provider {
                         Self::get_clip_char(clipboard_type),
                         base64::encode(content)
                     ))
-                )?;
-                Ok(())
-            })
+                )
+                .map_err(|e| e.into()),
+            ))
         }
     }
 

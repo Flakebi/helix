@@ -2498,7 +2498,7 @@ pub mod cmd {
         cx: &'a mut compositor::Context,
         clipboard_type: ClipboardType,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(async {
+        Box::pin(async move {
             let (view, doc) = current!(cx.editor);
             let fut = cx.editor.clipboard_provider.get_contents(clipboard_type);
 
