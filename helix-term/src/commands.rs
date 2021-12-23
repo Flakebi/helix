@@ -153,13 +153,27 @@ pub enum MappableCommand {
     },
 }
 
+macro_rules! static_command {
+    (async $fun:ident) => {
+        $name
+    };
+    ($fun:ident) => {
+        |cx| Box::pin(futures_util::future::ready($fun(cx)))
+    };
+}
+
+macro_rules! static_command_name {
+    (async $fun:ident) => { $fun };
+    ($fun:ident) => { $fun };
+}
+
 macro_rules! static_commands {
-    ( $($name:ident, $doc:literal,)* ) => {
+    ( $($($decl:tt)? $name:ident, $doc:literal,)* ) => {
         $(
             #[allow(non_upper_case_globals)]
             pub const $name: Self = Self::Static {
                 name: stringify!($name),
-                fun: $name,
+                fun: static_command!($($decl)?, $name),
                 doc: $doc
             };
         )*
@@ -331,19 +345,19 @@ impl MappableCommand {
         earlier, "Move backward in history",
         later, "Move forward in history",
         yank, "Yank selection",
-        yank_joined_to_clipboard, "Join and yank selections to clipboard",
-        yank_main_selection_to_clipboard, "Yank main selection to clipboard",
-        yank_joined_to_primary_clipboard, "Join and yank selections to primary clipboard",
-        yank_main_selection_to_primary_clipboard, "Yank main selection to primary clipboard",
+        async yank_joined_to_clipboard, "Join and yank selections to clipboard",
+        async yank_main_selection_to_clipboard, "Yank main selection to clipboard",
+        async yank_joined_to_primary_clipboard, "Join and yank selections to primary clipboard",
+        async yank_main_selection_to_primary_clipboard, "Yank main selection to primary clipboard",
         replace_with_yanked, "Replace with yanked text",
-        replace_selections_with_clipboard, "Replace selections by clipboard content",
-        replace_selections_with_primary_clipboard, "Replace selections by primary clipboard content",
+        async replace_selections_with_clipboard, "Replace selections by clipboard content",
+        async replace_selections_with_primary_clipboard, "Replace selections by primary clipboard content",
         paste_after, "Paste after selection",
         paste_before, "Paste before selection",
-        paste_clipboard_after, "Paste clipboard after selections",
-        paste_clipboard_before, "Paste clipboard before selections",
-        paste_primary_clipboard_after, "Paste primary clipboard after selections",
-        paste_primary_clipboard_before, "Paste primary clipboard before selections",
+        async paste_clipboard_after, "Paste clipboard after selections",
+        async paste_clipboard_before, "Paste clipboard before selections",
+        async paste_primary_clipboard_after, "Paste primary clipboard after selections",
+        async paste_primary_clipboard_before, "Paste primary clipboard before selections",
         indent, "Indent selection",
         unindent, "Unindent selection",
         format_selections, "Format selection",
