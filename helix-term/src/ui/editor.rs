@@ -26,11 +26,12 @@ use helix_view::{
 use std::borrow::Cow;
 
 use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use futures_util::future::BoxFuture;
 use tui::buffer::Buffer as Surface;
 
 pub struct EditorView {
     keymaps: Keymaps,
-    on_next_key: Option<Box<dyn FnOnce(&mut commands::Context, KeyEvent)>>,
+    on_next_key: Option<Box<dyn FnOnce(&mut commands::Context, KeyEvent) + Send>>,
     last_insert: (commands::MappableCommand, Vec<KeyEvent>),
     pub(crate) completion: Option<Completion>,
     spinners: ProgressSpinners,
@@ -928,7 +929,11 @@ impl EditorView {
 }
 
 impl Component for EditorView {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event<'a, 'b>(
+        &'a mut self,
+        event: Event,
+        cx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, EventResult> {
         let mut cxt = commands::Context {
             editor: cx.editor,
             count: None,
@@ -938,111 +943,113 @@ impl Component for EditorView {
             jobs: cx.jobs,
         };
 
-        match event {
-            Event::Resize(_width, _height) => {
-                // Ignore this event, we handle resizing just before rendering to screen.
-                // Handling it here but not re-rendering will cause flashing
-                EventResult::Consumed(None)
-            }
-            Event::Key(key) => {
-                cxt.editor.reset_idle_timer();
-                let mut key = KeyEvent::from(key);
-                canonicalize_key(&mut key);
-                // clear status
-                cxt.editor.status_msg = None;
+        Box::pin(async move {
+            match event {
+                Event::Resize(_width, _height) => {
+                    // Ignore this event, we handle resizing just before rendering to screen.
+                    // Handling it here but not re-rendering will cause flashing
+                    EventResult::Consumed(None)
+                }
+                Event::Key(key) => {
+                    cxt.editor.reset_idle_timer();
+                    let mut key = KeyEvent::from(key);
+                    canonicalize_key(&mut key);
+                    // clear status
+                    cxt.editor.status_msg = None;
 
-                let (_, doc) = current!(cxt.editor);
-                let mode = doc.mode();
+                    let (_, doc) = current!(cxt.editor);
+                    let mode = doc.mode();
 
-                if let Some(on_next_key) = self.on_next_key.take() {
-                    // if there's a command waiting input, do that first
-                    on_next_key(&mut cxt, key);
-                } else {
-                    match mode {
-                        Mode::Insert => {
-                            // record last_insert key
-                            self.last_insert.1.push(key);
+                    if let Some(on_next_key) = self.on_next_key.take() {
+                        // if there's a command waiting input, do that first
+                        on_next_key(&mut cxt, key);
+                    } else {
+                        match mode {
+                            Mode::Insert => {
+                                // record last_insert key
+                                self.last_insert.1.push(key);
 
-                            // let completion swallow the event if necessary
-                            let mut consumed = false;
-                            if let Some(completion) = &mut self.completion {
-                                // use a fake context here
-                                let mut cx = Context {
-                                    editor: cxt.editor,
-                                    jobs: cxt.jobs,
-                                    scroll: None,
-                                };
-                                let res = completion.handle_event(event, &mut cx);
-
-                                if let EventResult::Consumed(callback) = res {
-                                    consumed = true;
-
-                                    if callback.is_some() {
-                                        // assume close_fn
-                                        self.clear_completion(cxt.editor);
-                                    }
-                                }
-                            }
-
-                            // if completion didn't take the event, we pass it onto commands
-                            if !consumed {
-                                self.insert_mode(&mut cxt, key);
-
-                                // lastly we recalculate completion
+                                // let completion swallow the event if necessary
+                                let mut consumed = false;
                                 if let Some(completion) = &mut self.completion {
-                                    completion.update(&mut cxt);
-                                    if completion.is_empty() {
-                                        self.clear_completion(cxt.editor);
+                                    // use a fake context here
+                                    let mut cx = Context {
+                                        editor: cxt.editor,
+                                        jobs: cxt.jobs,
+                                        scroll: None,
+                                    };
+                                    let res = completion.handle_event(event, &mut cx).await;
+
+                                    if let EventResult::Consumed(callback) = res {
+                                        consumed = true;
+
+                                        if callback.is_some() {
+                                            // assume close_fn
+                                            self.clear_completion(cxt.editor);
+                                        }
+                                    }
+                                }
+
+                                // if completion didn't take the event, we pass it onto commands
+                                if !consumed {
+                                    self.insert_mode(&mut cxt, key).await;
+
+                                    // lastly we recalculate completion
+                                    if let Some(completion) = &mut self.completion {
+                                        completion.update(&mut cxt);
+                                        if completion.is_empty() {
+                                            self.clear_completion(cxt.editor);
+                                        }
                                     }
                                 }
                             }
+                            mode => self.command_mode(mode, &mut cxt, key).await,
                         }
-                        mode => self.command_mode(mode, &mut cxt, key),
                     }
+
+                    self.on_next_key = cxt.on_next_key_callback.take();
+                    // appease borrowck
+                    let callback = cxt.callback.take();
+
+                    // if the command consumed the last view, skip the render.
+                    // on the next loop cycle the Application will then terminate.
+                    if cxt.editor.should_close() {
+                        return EventResult::Ignored;
+                    }
+
+                    let (view, doc) = current!(cxt.editor);
+                    view.ensure_cursor_in_view(doc, cxt.editor.config.scrolloff);
+
+                    // mode transitions
+                    match (mode, doc.mode()) {
+                        (Mode::Normal, Mode::Insert) => {
+                            // HAXX: if we just entered insert mode from normal, clear key buf
+                            // and record the command that got us into this mode.
+
+                            // how we entered insert mode is important, and we should track that so
+                            // we can repeat the side effect.
+
+                            self.last_insert.0 =
+                                match self.keymaps.get_mut(&mode).unwrap().get(key).kind {
+                                    KeymapResultKind::Matched(command) => command,
+                                    // FIXME: insert mode can only be entered through single KeyCodes
+                                    _ => unimplemented!(),
+                                };
+                            self.last_insert.1.clear();
+                        }
+                        (Mode::Insert, Mode::Normal) => {
+                            // if exiting insert mode, remove completion
+                            self.completion = None;
+                        }
+                        _ => (),
+                    }
+
+                    EventResult::Consumed(callback)
                 }
 
-                self.on_next_key = cxt.on_next_key_callback.take();
-                // appease borrowck
-                let callback = cxt.callback.take();
-
-                // if the command consumed the last view, skip the render.
-                // on the next loop cycle the Application will then terminate.
-                if cxt.editor.should_close() {
-                    return EventResult::Ignored;
-                }
-
-                let (view, doc) = current!(cxt.editor);
-                view.ensure_cursor_in_view(doc, cxt.editor.config.scrolloff);
-
-                // mode transitions
-                match (mode, doc.mode()) {
-                    (Mode::Normal, Mode::Insert) => {
-                        // HAXX: if we just entered insert mode from normal, clear key buf
-                        // and record the command that got us into this mode.
-
-                        // how we entered insert mode is important, and we should track that so
-                        // we can repeat the side effect.
-
-                        self.last_insert.0 =
-                            match self.keymaps.get_mut(&mode).unwrap().get(key).kind {
-                                KeymapResultKind::Matched(command) => command,
-                                // FIXME: insert mode can only be entered through single KeyCodes
-                                _ => unimplemented!(),
-                            };
-                        self.last_insert.1.clear();
-                    }
-                    (Mode::Insert, Mode::Normal) => {
-                        // if exiting insert mode, remove completion
-                        self.completion = None;
-                    }
-                    _ => (),
-                }
-
-                EventResult::Consumed(callback)
+                Event::Mouse(event) => self.handle_mouse_event(event, &mut cxt).await,
             }
-
-            Event::Mouse(event) => self.handle_mouse_event(event, &mut cxt),
-        }
+        })
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {

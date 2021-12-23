@@ -1,7 +1,7 @@
 use crate::compositor::{Component, Compositor, Context, EventResult};
 use crate::{alt, ctrl, key, shift, ui};
 use crossterm::event::Event;
-use futures_util::future::BoxFuture;
+use futures_util::future::{self, BoxFuture};
 use helix_view::input::KeyEvent;
 use helix_view::keyboard::{KeyCode, KeyModifiers};
 use std::{borrow::Cow, ops::RangeFrom};
@@ -25,9 +25,10 @@ pub struct Prompt {
     selection: Option<usize>,
     history_register: Option<char>,
     history_pos: Option<usize>,
-    completion_fn: Box<dyn FnMut(&str) -> Vec<Completion>>,
-    callback_fn: Box<dyn for<'a> FnMut(&'a mut Context, &'a str, PromptEvent) -> BoxFuture<'a, ()>>,
-    pub doc_fn: Box<dyn Fn(&str) -> Option<&'static str>>,
+    completion_fn: Box<dyn FnMut(&str) -> Vec<Completion> + Send>,
+    callback_fn:
+        Box<dyn for<'a> FnMut(&'a mut Context, &'a str, PromptEvent) -> BoxFuture<'a, ()> + Send>,
+    pub doc_fn: Box<dyn Fn(&str) -> Option<&'static str> + Send>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -60,8 +61,9 @@ impl Prompt {
     pub fn new(
         prompt: Cow<'static, str>,
         history_register: Option<char>,
-        mut completion_fn: impl FnMut(&str) -> Vec<Completion> + 'static,
+        mut completion_fn: impl FnMut(&str) -> Vec<Completion> + Send + 'static,
         callback_fn: impl for<'a> FnMut(&'a mut Context, &'a str, PromptEvent) -> BoxFuture<'a, ()>
+            + Send
             + 'static,
     ) -> Self {
         Self {
@@ -421,109 +423,116 @@ impl Prompt {
 }
 
 impl Component for Prompt {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event<'a, 'b>(
+        &'a mut self,
+        event: Event,
+        cx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, EventResult> {
         let event = match event {
             Event::Key(event) => event,
-            Event::Resize(..) => return EventResult::Consumed(None),
-            _ => return EventResult::Ignored,
+            Event::Resize(..) => return Box::pin(future::ready(EventResult::Consumed(None))),
+            _ => return Box::pin(future::ready(EventResult::Ignored)),
         };
 
         let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _| {
             // remove the layer
             compositor.pop();
+            Box::pin(future::ready(()))
         })));
 
-        match event.into() {
-            ctrl!('c') | key!(Esc) => {
-                (self.callback_fn)(cx, &self.line, PromptEvent::Abort);
-                return close_fn;
-            }
-            alt!('b') | alt!(Left) => self.move_cursor(Movement::BackwardWord(1)),
-            alt!('f') | alt!(Right) => self.move_cursor(Movement::ForwardWord(1)),
-            ctrl!('b') | key!(Left) => self.move_cursor(Movement::BackwardChar(1)),
-            ctrl!('f') | key!(Right) => self.move_cursor(Movement::ForwardChar(1)),
-            ctrl!('e') | key!(End) => self.move_end(),
-            ctrl!('a') | key!(Home) => self.move_start(),
-            ctrl!('w') => self.delete_word_backwards(),
-            alt!('d') => self.delete_word_forwards(),
-            ctrl!('k') => self.kill_to_end_of_line(),
-            ctrl!('u') => self.kill_to_start_of_line(),
-            ctrl!('h') | key!(Backspace) => {
-                self.delete_char_backwards();
-                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
-            }
-            ctrl!('d') | key!(Delete) => {
-                self.delete_char_forwards();
-                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
-            }
-            ctrl!('s') => {
-                let (view, doc) = current!(cx.editor);
-                let text = doc.text().slice(..);
-
-                use helix_core::textobject;
-                let range = textobject::textobject_word(
-                    text,
-                    doc.selection(view.id).primary(),
-                    textobject::TextObject::Inside,
-                    1,
-                    false,
-                );
-                let line = text.slice(range.from()..range.to()).to_string();
-                if !line.is_empty() {
-                    self.insert_str(line.as_str());
-                    (self.callback_fn)(cx, &self.line, PromptEvent::Update);
-                }
-            }
-            key!(Enter) => {
-                if self.selection.is_some() && self.line.ends_with('/') {
-                    self.completion = (self.completion_fn)(&self.line);
-                    self.exit_selection();
-                } else {
-                    (self.callback_fn)(cx, &self.line, PromptEvent::Validate);
-
-                    if let Some(register) = self.history_register {
-                        // store in history
-                        let register = cx.editor.registers.get_mut(register);
-                        register.push(self.line.clone());
-                    }
+        Box::pin(async move {
+            match event.into() {
+                ctrl!('c') | key!(Esc) => {
+                    (self.callback_fn)(cx, &self.line, PromptEvent::Abort).await;
                     return close_fn;
                 }
-            }
-            ctrl!('p') | key!(Up) => {
-                if let Some(register) = self.history_register {
-                    let register = cx.editor.registers.get_mut(register);
-                    self.change_history(register.read(), CompletionDirection::Backward);
-                    (self.callback_fn)(cx, &self.line, PromptEvent::Update);
+                alt!('b') | alt!(Left) => self.move_cursor(Movement::BackwardWord(1)),
+                alt!('f') | alt!(Right) => self.move_cursor(Movement::ForwardWord(1)),
+                ctrl!('b') | key!(Left) => self.move_cursor(Movement::BackwardChar(1)),
+                ctrl!('f') | key!(Right) => self.move_cursor(Movement::ForwardChar(1)),
+                ctrl!('e') | key!(End) => self.move_end(),
+                ctrl!('a') | key!(Home) => self.move_start(),
+                ctrl!('w') => self.delete_word_backwards(),
+                alt!('d') => self.delete_word_forwards(),
+                ctrl!('k') => self.kill_to_end_of_line(),
+                ctrl!('u') => self.kill_to_start_of_line(),
+                ctrl!('h') | key!(Backspace) => {
+                    self.delete_char_backwards();
+                    (self.callback_fn)(cx, &self.line, PromptEvent::Update).await;
                 }
-            }
-            ctrl!('n') | key!(Down) => {
-                if let Some(register) = self.history_register {
-                    let register = cx.editor.registers.get_mut(register);
-                    self.change_history(register.read(), CompletionDirection::Forward);
-                    (self.callback_fn)(cx, &self.line, PromptEvent::Update);
+                ctrl!('d') | key!(Delete) => {
+                    self.delete_char_forwards();
+                    (self.callback_fn)(cx, &self.line, PromptEvent::Update).await;
                 }
-            }
-            key!(Tab) => {
-                self.change_completion_selection(CompletionDirection::Forward);
-                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
-            }
-            shift!(Tab) => {
-                self.change_completion_selection(CompletionDirection::Backward);
-                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
-            }
-            ctrl!('q') => self.exit_selection(),
-            // any char event that's not combined with control or mapped to any other combo
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-            } if !modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(c);
-                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
-            }
-            _ => (),
-        };
+                ctrl!('s') => {
+                    let (view, doc) = current!(cx.editor);
+                    let text = doc.text().slice(..);
 
-        EventResult::Consumed(None)
+                    use helix_core::textobject;
+                    let range = textobject::textobject_word(
+                        text,
+                        doc.selection(view.id).primary(),
+                        textobject::TextObject::Inside,
+                        1,
+                        false,
+                    );
+                    let line = text.slice(range.from()..range.to()).to_string();
+                    if !line.is_empty() {
+                        self.insert_str(line.as_str());
+                        (self.callback_fn)(cx, &self.line, PromptEvent::Update).await;
+                    }
+                }
+                key!(Enter) => {
+                    if self.selection.is_some() && self.line.ends_with('/') {
+                        self.completion = (self.completion_fn)(&self.line);
+                        self.exit_selection();
+                    } else {
+                        (self.callback_fn)(cx, &self.line, PromptEvent::Validate).await;
+
+                        if let Some(register) = self.history_register {
+                            // store in history
+                            let register = cx.editor.registers.get_mut(register);
+                            register.push(self.line.clone());
+                        }
+                        return close_fn;
+                    }
+                }
+                ctrl!('p') | key!(Up) => {
+                    if let Some(register) = self.history_register {
+                        let register = cx.editor.registers.get_mut(register);
+                        self.change_history(register.read(), CompletionDirection::Backward);
+                        (self.callback_fn)(cx, &self.line, PromptEvent::Update).await;
+                    }
+                }
+                ctrl!('n') | key!(Down) => {
+                    if let Some(register) = self.history_register {
+                        let register = cx.editor.registers.get_mut(register);
+                        self.change_history(register.read(), CompletionDirection::Forward);
+                        (self.callback_fn)(cx, &self.line, PromptEvent::Update).await;
+                    }
+                }
+                key!(Tab) => {
+                    self.change_completion_selection(CompletionDirection::Forward);
+                    (self.callback_fn)(cx, &self.line, PromptEvent::Update).await;
+                }
+                shift!(Tab) => {
+                    self.change_completion_selection(CompletionDirection::Backward);
+                    (self.callback_fn)(cx, &self.line, PromptEvent::Update).await;
+                }
+                ctrl!('q') => self.exit_selection(),
+                // any char event that's not combined with control or mapped to any other combo
+                KeyEvent {
+                    code: KeyCode::Char(c),
+                    modifiers,
+                } if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.insert_char(c);
+                    (self.callback_fn)(cx, &self.line, PromptEvent::Update).await;
+                }
+                _ => (),
+            };
+
+            EventResult::Consumed(None)
+        })
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {

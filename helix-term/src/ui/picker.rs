@@ -4,6 +4,7 @@ use crate::{
     ui::EditorView,
 };
 use crossterm::event::Event;
+use futures_util::future::{self, BoxFuture};
 use tui::{
     buffer::Buffer as Surface,
     widgets::{Block, BorderType, Borders},
@@ -35,14 +36,14 @@ pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 /// File path and range of lines (used to align and highlight lines)
 type FileLocation = (PathBuf, Option<(usize, usize)>);
 
-pub struct FilePicker<T> {
+pub struct FilePicker<T: Send> {
     picker: Picker<T>,
     pub truncate_start: bool,
     /// Caches paths to documents
     preview_cache: HashMap<PathBuf, CachedPreview>,
     read_buffer: Vec<u8>,
     /// Given an item in the picker, return the file path and line number to display.
-    file_fn: Box<dyn Fn(&Editor, &T) -> Option<FileLocation>>,
+    file_fn: Box<dyn Fn(&Editor, &T) -> Option<FileLocation> + Send>,
 }
 
 pub enum CachedPreview {
@@ -82,12 +83,12 @@ impl Preview<'_, '_> {
     }
 }
 
-impl<T> FilePicker<T> {
+impl<T: Send> FilePicker<T> {
     pub fn new(
         options: Vec<T>,
-        format_fn: impl Fn(&T) -> Cow<str> + 'static,
-        callback_fn: impl Fn(&mut Editor, &T, Action) + 'static,
-        preview_fn: impl Fn(&Editor, &T) -> Option<FileLocation> + 'static,
+        format_fn: impl Fn(&T) -> Cow<str> + Send + 'static,
+        callback_fn: impl Fn(&mut Editor, &T, Action) + Send + 'static,
+        preview_fn: impl Fn(&Editor, &T) -> Option<FileLocation> + Send + 'static,
     ) -> Self {
         Self {
             picker: Picker::new(false, options, format_fn, callback_fn),
@@ -151,7 +152,7 @@ impl<T> FilePicker<T> {
     }
 }
 
-impl<T: 'static> Component for FilePicker<T> {
+impl<T: Send + 'static> Component for FilePicker<T> {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         // +---------+ +---------+
         // |prompt   | |preview  |
@@ -256,7 +257,11 @@ impl<T: 'static> Component for FilePicker<T> {
         }
     }
 
-    fn handle_event(&mut self, event: Event, ctx: &mut Context) -> EventResult {
+    fn handle_event<'a, 'b>(
+        &'a mut self,
+        event: Event,
+        ctx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, EventResult> {
         // TODO: keybinds for scrolling preview
         self.picker.handle_event(event, ctx)
     }
@@ -266,7 +271,7 @@ impl<T: 'static> Component for FilePicker<T> {
     }
 }
 
-pub struct Picker<T> {
+pub struct Picker<T: Send> {
     options: Vec<T>,
     // filter: String,
     matcher: Box<Matcher>,
@@ -283,16 +288,16 @@ pub struct Picker<T> {
     /// Wheather to truncate the start (default true)
     pub truncate_start: bool,
 
-    format_fn: Box<dyn Fn(&T) -> Cow<str>>,
-    callback_fn: Box<dyn Fn(&mut Editor, &T, Action)>,
+    format_fn: Box<dyn Fn(&T) -> Cow<str> + Send>,
+    callback_fn: Box<dyn Fn(&mut Editor, &T, Action) + Send>,
 }
 
-impl<T> Picker<T> {
+impl<T: Send> Picker<T> {
     pub fn new(
         render_centered: bool,
         options: Vec<T>,
-        format_fn: impl Fn(&T) -> Cow<str> + 'static,
-        callback_fn: impl Fn(&mut Editor, &T, Action) + 'static,
+        format_fn: impl Fn(&T) -> Cow<str> + Send + 'static,
+        callback_fn: impl Fn(&mut Editor, &T, Action) + Send + 'static,
     ) -> Self {
         let prompt = Prompt::new(
             "".into(),
@@ -397,59 +402,66 @@ fn inner_rect(area: Rect) -> Rect {
     area.inner(&margin)
 }
 
-impl<T: 'static> Component for Picker<T> {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+impl<T: Send + 'static> Component for Picker<T> {
+    fn handle_event<'a, 'b>(
+        &'a mut self,
+        event: Event,
+        cx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, EventResult> {
         let key_event = match event {
             Event::Key(event) => event,
-            Event::Resize(..) => return EventResult::Consumed(None),
-            _ => return EventResult::Ignored,
+            Event::Resize(..) => return Box::pin(future::ready(EventResult::Consumed(None))),
+            _ => return Box::pin(future::ready(EventResult::Ignored)),
         };
 
         let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _| {
             // remove the layer
             compositor.last_picker = compositor.pop();
+            Box::pin(future::ready(()))
         })));
 
-        match key_event.into() {
-            shift!(Tab) | key!(Up) | ctrl!('p') | ctrl!('k') => {
-                self.move_up();
-            }
-            key!(Tab) | key!(Down) | ctrl!('n') | ctrl!('j') => {
-                self.move_down();
-            }
-            key!(Esc) | ctrl!('c') => {
-                return close_fn;
-            }
-            key!(Enter) => {
-                if let Some(option) = self.selection() {
-                    (self.callback_fn)(cx.editor, option, Action::Replace);
+        Box::pin(async move {
+            match key_event.into() {
+                shift!(Tab) | key!(Up) | ctrl!('p') | ctrl!('k') => {
+                    self.move_up();
                 }
-                return close_fn;
-            }
-            ctrl!('s') => {
-                if let Some(option) = self.selection() {
-                    (self.callback_fn)(cx.editor, option, Action::HorizontalSplit);
+                key!(Tab) | key!(Down) | ctrl!('n') | ctrl!('j') => {
+                    self.move_down();
                 }
-                return close_fn;
-            }
-            ctrl!('v') => {
-                if let Some(option) = self.selection() {
-                    (self.callback_fn)(cx.editor, option, Action::VerticalSplit);
+                key!(Esc) | ctrl!('c') => {
+                    return close_fn;
                 }
-                return close_fn;
-            }
-            ctrl!(' ') => {
-                self.save_filter();
-            }
-            _ => {
-                if let EventResult::Consumed(_) = self.prompt.handle_event(event, cx) {
-                    // TODO: recalculate only if pattern changed
-                    self.score();
+                key!(Enter) => {
+                    if let Some(option) = self.selection() {
+                        (self.callback_fn)(cx.editor, option, Action::Replace);
+                    }
+                    return close_fn;
+                }
+                ctrl!('s') => {
+                    if let Some(option) = self.selection() {
+                        (self.callback_fn)(cx.editor, option, Action::HorizontalSplit);
+                    }
+                    return close_fn;
+                }
+                ctrl!('v') => {
+                    if let Some(option) = self.selection() {
+                        (self.callback_fn)(cx.editor, option, Action::VerticalSplit);
+                    }
+                    return close_fn;
+                }
+                ctrl!(' ') => {
+                    self.save_filter();
+                }
+                _ => {
+                    if let EventResult::Consumed(_) = self.prompt.handle_event(event, cx).await {
+                        // TODO: recalculate only if pattern changed
+                        self.score();
+                    }
                 }
             }
-        }
 
-        EventResult::Consumed(None)
+            EventResult::Consumed(None)
+        })
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {

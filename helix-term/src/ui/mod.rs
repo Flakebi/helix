@@ -29,8 +29,8 @@ pub fn regex_prompt(
     cx: &mut crate::commands::Context,
     prompt: std::borrow::Cow<'static, str>,
     history_register: Option<char>,
-    completion_fn: impl FnMut(&str) -> Vec<prompt::Completion> + 'static,
-    fun: impl Fn(&mut View, &mut Document, Regex, PromptEvent) + 'static,
+    completion_fn: impl FnMut(&str) -> Vec<prompt::Completion> + Send + 'static,
+    fun: impl Fn(&mut View, &mut Document, Regex, PromptEvent) + Send + 'static,
 ) -> Prompt {
     let (view, doc) = current!(cx.editor);
     let view_id = view.id;

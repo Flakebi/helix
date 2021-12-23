@@ -63,22 +63,23 @@ pub struct Context<'a> {
     pub editor: &'a mut Editor,
 
     pub callback: Option<crate::compositor::Callback>,
-    pub on_next_key_callback: Option<Box<dyn FnOnce(&mut Context, KeyEvent)>>,
+    pub on_next_key_callback: Option<Box<dyn FnOnce(&mut Context, KeyEvent) + Send>>,
     pub jobs: &'a mut Jobs,
 }
 
 impl<'a> Context<'a> {
     /// Push a new component onto the compositor.
-    pub fn push_layer(&mut self, component: Box<dyn Component>) {
+    pub fn push_layer(&mut self, component: Box<dyn Component + Send>) {
         self.callback = Some(Box::new(|compositor: &mut Compositor, _| {
-            compositor.push(component)
+            compositor.push(component);
+            Box::pin(future::ready(()))
         }));
     }
 
     #[inline]
     pub fn on_next_key(
         &mut self,
-        on_next_key_callback: impl FnOnce(&mut Context, KeyEvent) + 'static,
+        on_next_key_callback: impl FnOnce(&mut Context, KeyEvent) + Send + 'static,
     ) {
         self.on_next_key_callback = Some(Box::new(on_next_key_callback));
     }
@@ -3534,6 +3535,7 @@ fn last_picker(cx: &mut Context) {
         }
         // XXX: figure out how to show error when no last picker lifetime
         // cx.editor.set_error("no last picker".to_owned())
+        Box::pin(future::ready(()))
     }));
 }
 
@@ -6070,11 +6072,15 @@ fn play_macro(cx: &mut Context) {
 
     cx.callback = Some(Box::new(
         move |compositor: &mut Compositor, cx: &mut compositor::Context| {
-            for _ in 0..count {
-                for &key in keys.iter() {
-                    compositor.handle_event(crossterm::event::Event::Key(key.into()), cx);
+            Box::pin(async move {
+                for _ in 0..count {
+                    for &key in keys.iter() {
+                        compositor
+                            .handle_event(crossterm::event::Event::Key(key.into()), cx)
+                            .await;
+                    }
                 }
-            }
+            })
         },
     ));
 }

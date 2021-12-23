@@ -3,6 +3,7 @@ use crate::{
     ctrl, key, shift,
 };
 use crossterm::event::Event;
+use futures_util::future::{self, BoxFuture};
 use tui::{buffer::Buffer as Surface, widgets::Table};
 
 pub use tui::widgets::{Cell, Row};
@@ -13,7 +14,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use helix_view::{graphics::Rect, Editor};
 use tui::layout::Constraint;
 
-pub trait Item {
+pub trait Item: Send {
     fn sort_text(&self) -> &str;
     fn filter_text(&self) -> &str;
 
@@ -32,7 +33,7 @@ pub struct Menu<T: Item> {
 
     widths: Vec<Constraint>,
 
-    callback_fn: Box<dyn Fn(&mut Editor, Option<&T>, MenuEvent)>,
+    callback_fn: Box<dyn Fn(&mut Editor, Option<&T>, MenuEvent) + Send>,
 
     scroll: usize,
     size: (u16, u16),
@@ -45,7 +46,7 @@ impl<T: Item> Menu<T> {
     // rendering)
     pub fn new(
         options: Vec<T>,
-        callback_fn: impl Fn(&mut Editor, Option<&T>, MenuEvent) + 'static,
+        callback_fn: impl Fn(&mut Editor, Option<&T>, MenuEvent) + Send + 'static,
     ) -> Self {
         let mut menu = Self {
             options,
@@ -184,40 +185,45 @@ impl<T: Item> Menu<T> {
 use super::PromptEvent as MenuEvent;
 
 impl<T: Item + 'static> Component for Menu<T> {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event<'a, 'b>(
+        &'a mut self,
+        event: Event,
+        cx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, EventResult> {
         let event = match event {
             Event::Key(event) => event,
-            _ => return EventResult::Ignored,
+            _ => return Box::pin(future::ready(EventResult::Ignored)),
         };
 
         let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _| {
             // remove the layer
             compositor.pop();
+            Box::pin(future::ready(()))
         })));
 
         match event.into() {
             // esc or ctrl-c aborts the completion and closes the menu
             key!(Esc) | ctrl!('c') => {
                 (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Abort);
-                return close_fn;
+                return Box::pin(future::ready(close_fn));
             }
             // arrow up/ctrl-p/shift-tab prev completion choice (including updating the doc)
             shift!(Tab) | key!(Up) | ctrl!('p') | ctrl!('k') => {
                 self.move_up();
                 (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
-                return EventResult::Consumed(None);
+                return Box::pin(future::ready(EventResult::Consumed(None)));
             }
             key!(Tab) | key!(Down) | ctrl!('n') | ctrl!('j') => {
                 // arrow down/ctrl-n/tab advances completion choice (including updating the doc)
                 self.move_down();
                 (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
-                return EventResult::Consumed(None);
+                return Box::pin(future::ready(EventResult::Consumed(None)));
             }
             key!(Enter) => {
                 if let Some(selection) = self.selection() {
                     (self.callback_fn)(cx.editor, Some(selection), MenuEvent::Validate);
                 }
-                return close_fn;
+                return Box::pin(future::ready(close_fn));
             }
             // KeyEvent {
             //     code: KeyCode::Char(c),
@@ -237,7 +243,7 @@ impl<T: Item + 'static> Component for Menu<T> {
         // for some events, we want to process them but send ignore, specifically all input except
         // tab/enter/ctrl-k or whatever will confirm the selection/ ctrl-n/ctrl-p for scroll.
         // EventResult::Consumed(None)
-        EventResult::Ignored
+        Box::pin(future::ready(EventResult::Ignored))
     }
 
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {

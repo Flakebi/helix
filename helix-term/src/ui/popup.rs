@@ -3,6 +3,7 @@ use crate::{
     ctrl, key,
 };
 use crossterm::event::Event;
+use futures_util::future::{self, BoxFuture};
 use tui::buffer::Buffer as Surface;
 
 use helix_core::Position;
@@ -90,36 +91,43 @@ impl<T: Component> Popup<T> {
 }
 
 impl<T: Component> Component for Popup<T> {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event<'a, 'b>(
+        &'a mut self,
+        event: Event,
+        cx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, EventResult> {
         let key = match event {
             Event::Key(event) => event,
             Event::Resize(_, _) => {
                 // TODO: calculate inner area, call component's handle_event with that area
-                return EventResult::Ignored;
+                return Box::pin(future::ready(EventResult::Ignored));
             }
-            _ => return EventResult::Ignored,
+            _ => return Box::pin(future::ready(EventResult::Ignored)),
         };
 
         let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _| {
             // remove the layer
             compositor.pop();
+            Box::pin(future::ready(()))
         })));
 
-        match key.into() {
-            // esc or ctrl-c aborts the completion and closes the menu
-            key!(Esc) | ctrl!('c') => close_fn,
-            ctrl!('d') => {
-                self.scroll(self.size.1 as usize / 2, true);
-                EventResult::Consumed(None)
+        Box::pin(async move {
+            match key.into() {
+                // esc or ctrl-c aborts the completion and closes the menu
+                key!(Esc) | ctrl!('c') => close_fn,
+                ctrl!('d') => {
+                    self.scroll(self.size.1 as usize / 2, true);
+                    EventResult::Consumed(None)
+                }
+                ctrl!('u') => {
+                    self.scroll(self.size.1 as usize / 2, false);
+                    EventResult::Consumed(None)
+                }
+                _ => self.contents.handle_event(event, cx).await,
             }
-            ctrl!('u') => {
-                self.scroll(self.size.1 as usize / 2, false);
-                EventResult::Consumed(None)
-            }
-            _ => self.contents.handle_event(event, cx),
-        }
-        // for some events, we want to process them but send ignore, specifically all input except
-        // tab/enter/ctrl-k or whatever will confirm the selection/ ctrl-n/ctrl-p for scroll.
+            // for some events, we want to process them but send ignore, specifically all input except
+            // tab/enter/ctrl-k or whatever will confirm the selection/ ctrl-n/ctrl-p for scroll.
+        })
     }
 
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {

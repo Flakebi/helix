@@ -1,5 +1,6 @@
 use crate::compositor::{Component, Context, EventResult};
 use crossterm::event::{Event, KeyCode, KeyEvent};
+use futures_util::future::{self, BoxFuture};
 use tui::buffer::Buffer as Surface;
 
 use std::borrow::Cow;
@@ -234,13 +235,17 @@ impl Completion {
 // ... since completion is a special case, maybe just build it into doc/render?
 
 impl Component for Completion {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event<'a, 'b>(
+        &'a mut self,
+        event: Event,
+        cx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, EventResult> {
         // let the Editor handle Esc instead
         if let Event::Key(KeyEvent {
             code: KeyCode::Esc, ..
         }) = event
         {
-            return EventResult::Ignored;
+            return Box::pin(future::ready(EventResult::Ignored));
         }
         self.popup.handle_event(event, cx)
     }

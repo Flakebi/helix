@@ -219,7 +219,7 @@ impl Application {
                 biased;
 
                 event = reader.next() => {
-                    self.handle_terminal_events(event)
+                    self.handle_terminal_events(event).await
                 }
                 Some(signal) = self.signals.next() => {
                     self.handle_signals(signal).await;
@@ -303,7 +303,10 @@ impl Application {
         self.render();
     }
 
-    pub fn handle_terminal_events(&mut self, event: Option<Result<Event, crossterm::ErrorKind>>) {
+    pub async fn handle_terminal_events(
+        &mut self,
+        event: Option<Result<Event, crossterm::ErrorKind>>,
+    ) {
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             jobs: &mut self.jobs,
@@ -316,8 +319,9 @@ impl Application {
 
                 self.compositor
                     .handle_event(Event::Resize(width, height), &mut cx)
+                    .await
             }
-            Some(Ok(event)) => self.compositor.handle_event(event, &mut cx),
+            Some(Ok(event)) => self.compositor.handle_event(event, &mut cx).await,
             Some(Err(x)) => panic!("{}", x),
             None => panic!(),
         };

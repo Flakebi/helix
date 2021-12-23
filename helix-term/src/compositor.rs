@@ -5,9 +5,11 @@ use helix_core::Position;
 use helix_view::graphics::{CursorKind, Rect};
 
 use crossterm::event::Event;
+use futures_util::future::{self, BoxFuture};
 use tui::buffer::Buffer as Surface;
 
-pub type Callback = Box<dyn FnOnce(&mut Compositor, &mut Context)>;
+pub type Callback =
+    Box<dyn for<'a> FnOnce(&'a mut Compositor, &'a mut Context) -> BoxFuture<'a, ()> + Send>;
 
 // --> EventResult should have a callback that takes a context with methods like .popup(),
 // .prompt() etc. That way we can abstract it from the renderer.
@@ -33,10 +35,14 @@ pub struct Context<'a> {
     pub jobs: &'a mut Jobs,
 }
 
-pub trait Component: Any + AnyComponent {
+pub trait Component: Any + AnyComponent + Send {
     /// Process input events, return true if handled.
-    fn handle_event(&mut self, _event: Event, _ctx: &mut Context) -> EventResult {
-        EventResult::Ignored
+    fn handle_event<'a, 'b>(
+        &'a mut self,
+        _event: Event,
+        _ctx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, EventResult> {
+        Box::pin(future::ready(EventResult::Ignored))
     }
     // , args: ()
 
@@ -130,25 +136,31 @@ impl Compositor {
         self.layers.pop()
     }
 
-    pub fn handle_event(&mut self, event: Event, cx: &mut Context) -> bool {
+    pub fn handle_event<'a, 'b>(
+        &'a mut self,
+        event: Event,
+        cx: &'a mut Context<'b>,
+    ) -> BoxFuture<'a, bool> {
         // If it is a key event and a macro is being recorded, push the key event to the recording.
         if let (Event::Key(key), Some((_, keys))) = (event, &mut cx.editor.macro_recording) {
             keys.push(key.into());
         }
 
-        // propagate events through the layers until we either find a layer that consumes it or we
-        // run out of layers (event bubbling)
-        for layer in self.layers.iter_mut().rev() {
-            match layer.handle_event(event, cx) {
-                EventResult::Consumed(Some(callback)) => {
-                    callback(self, cx);
-                    return true;
-                }
-                EventResult::Consumed(None) => return true,
-                EventResult::Ignored => false,
-            };
-        }
-        false
+        Box::pin(async move {
+            // propagate events through the layers until we either find a layer that consumes it or we
+            // run out of layers (event bubbling)
+            for layer in self.layers.iter_mut().rev() {
+                match layer.handle_event(event, cx).await {
+                    EventResult::Consumed(Some(callback)) => {
+                        callback(self, cx);
+                        return true;
+                    }
+                    EventResult::Consumed(None) => return true,
+                    EventResult::Ignored => false,
+                };
+            }
+            false
+        })
     }
 
     pub fn render(&mut self, cx: &mut Context) {
